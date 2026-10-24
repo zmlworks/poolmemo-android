@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PoolMemo</string>
+    <string name="app_label">PoolMemo</string>
+    <string name="open_or_create">メモを開く / 作成</string>
+    <string name="pool_id">PoolSketch ID</string>
+    <string name="enc_key">暗号化キー</string>
+    <string name="generate">新規生成</string>
+    <string name="open">開く</string>
+    <string name="save">保存</string>
+    <string name="reload">再読込</string>
+    <string name="settings">設定</string>
+    <string name="copy_key">キーをコピー</string>
+    <string name="key_hint">キーは一度だけ表示されます。必ず控えてください。</string>
+    <string name="id_hint">6〜200文字の英数字・-_</string>
+    <string name="saving">保存中…</string>
+    <string name="loading">読込中…</string>
+    <string name="saved">保存しました</string>
+    <string name="loaded">読込みました</string>
+    <string name="save_failed">保存に失敗しました</string>
+    <string name="load_failed">読込みに失敗しました</string>
+    <string name="decrypt_failed">復号できません（キーが違うか平文です）</string>
+    <string name="empty_remote">クラウドは空です（新規メモ）</string>
+    <string name="need_id_key">ID とキーを入力してください</string>
+    <string name="invalid_id">ID が不正です（6〜200・英数-_）</string>
+    <string name="status_idle">アイドル</string>
+    <string name="status_dirty">未保存</string>
+    <string name="recent">最近使った ID</string>
+    <string name="change_memo">別のメモを開く</string>
+    <string name="key_generated">キーを生成しました。コピーして保管してください。</string>
+    <string name="copied">コピーしました</string>
+    <string name="network_error">ネットワークエラー</string>
+</resources>

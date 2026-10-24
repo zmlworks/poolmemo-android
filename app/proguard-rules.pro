@@ -1,0 +1,2 @@
+-keep class com.zmlworks.poolmemo.** { *; }
+-dontwarn javax.crypto.**

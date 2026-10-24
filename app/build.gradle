@@ -1,0 +1,58 @@
+plugins { id 'com.android.application' }
+
+def ksFile = file(System.getenv('ZML_KEYSTORE_PROPS') ?: '/workspace/android/keys/keystore.properties')
+def ks = new Properties()
+if (ksFile.exists()) ksFile.withInputStream { ks.load(it) }
+
+android {
+    namespace 'com.zmlworks.poolmemo'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    defaultConfig {
+        applicationId 'com.zmlworks.poolmemo'
+        minSdk 26
+        targetSdk 35
+        versionCode 3
+        versionName '0.2.2'
+    }
+    signingConfigs {
+        release {
+            if (ks['storeFile']) {
+                storeFile file(ks['storeFile'])
+                storePassword ks['storePassword']
+                keyAlias ks['keyAlias']
+                keyPassword ks['keyPassword']
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+            resValue 'string', 'app_variant', ' (debug)'
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            resValue 'string', 'app_variant', ''
+            if (ks['storeFile']) signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildFeatures { resValues true; buildConfig false }
+    lint {
+        abortOnError true
+        disable 'GradleDependency', 'NewerVersionAvailable', 'OldTargetApi', 'AndroidGradlePluginVersion'
+    }
+    testOptions {
+        unitTests { includeAndroidResources = true }
+    }
+    dependenciesInfo { includeInApk false; includeInBundle false }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
