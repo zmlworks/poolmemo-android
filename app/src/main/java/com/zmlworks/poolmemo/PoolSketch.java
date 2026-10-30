@@ -11,7 +11,8 @@ import java.util.regex.Pattern;
 
 /** Minimal PoolSketch client: GET /{id}, POST /edit.php (multipart). */
 final class PoolSketch {
-    private static final String BASE = "https://plsk.net";
+    /** Overridable for tests (mock server). */
+    static String base = "https://plsk.net";
     private static final Pattern TA = Pattern.compile(
             "<textarea[^>]*>(.*?)</textarea>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
     private static final Pattern DISP = Pattern.compile(
@@ -20,17 +21,21 @@ final class PoolSketch {
     private PoolSketch() {}
 
     static String fetch(String id) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/" + id).openConnection();
+        HttpURLConnection c = (HttpURLConnection) new URL(base + "/" + id).openConnection();
         c.setConnectTimeout(20000);
         c.setReadTimeout(30000);
-        c.setRequestProperty("User-Agent", "PoolMemo/0.1 (Android)");
+        c.setRequestProperty("User-Agent", "PoolMemo/0.3 (Android)");
         c.setInstanceFollowRedirects(true);
+        c.setUseCaches(false);
+        c.setRequestProperty("Cache-Control", "no-cache");
         int code = c.getResponseCode();
         InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
         String html = readAll(in);
         c.disconnect();
         if (code >= 400) throw new Exception("HTTP " + code);
-        return extractContent(html);
+        String content = extractContent(html);
+        if (content == null) throw new Exception("unexpected page");
+        return content;
     }
 
     static void save(String id, String txt) throws Exception {
@@ -43,12 +48,12 @@ final class PoolSketch {
         body.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
         byte[] bytes = body.toByteArray();
 
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/edit.php").openConnection();
+        HttpURLConnection c = (HttpURLConnection) new URL(base + "/edit.php").openConnection();
         c.setConnectTimeout(20000);
         c.setReadTimeout(30000);
         c.setDoOutput(true);
         c.setRequestMethod("POST");
-        c.setRequestProperty("User-Agent", "PoolMemo/0.1 (Android)");
+        c.setRequestProperty("User-Agent", "PoolMemo/0.3 (Android)");
         c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
         c.setFixedLengthStreamingMode(bytes.length);
         try (OutputStream os = c.getOutputStream()) {
@@ -69,13 +74,14 @@ final class PoolSketch {
         out.write("\r\n".getBytes(StandardCharsets.UTF_8));
     }
 
+    /** @return memo field, or null when the page has no memo field (error page etc.). */
     static String extractContent(String html) {
-        if (html == null) return "";
+        if (html == null) return null;
         Matcher m = TA.matcher(html);
         if (m.find()) return unescape(m.group(1));
         m = DISP.matcher(html);
         if (m.find()) return unescape(m.group(1));
-        return "";
+        return null;
     }
 
     private static String unescape(String s) {

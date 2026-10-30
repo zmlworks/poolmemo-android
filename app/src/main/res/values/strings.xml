@@ -30,4 +30,5 @@
     <string name="key_generated">キーを生成しました。コピーして保管してください。</string>
     <string name="copied">コピーしました</string>
     <string name="network_error">ネットワークエラー</string>
+    <string name="merged_conflict">別の端末と同じ箇所が同時に編集されたため、両方の内容を残しました</string>
 </resources>
