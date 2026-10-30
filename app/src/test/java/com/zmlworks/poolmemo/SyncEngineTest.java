@@ -190,14 +190,14 @@ public class SyncEngineTest {
 
     @Test public void legacyClientWrite() throws Exception {
         Server s = new Server();
-        s.wire = Crypto.encrypt("old\nmemo", KEY);         // written by v0.2.x
+        s.wire = Crypto.encryptV1("old\nmemo", KEY);       // written by v0.2.x
         Device a = new Device(s);
         a.sync();
         assertEquals("old\nmemo", a.text);
         a.text = "old\nmemo\nnew"; a.sync();
         // old client shows the header line, keeps it and edits line 1
         String plain = Crypto.decrypt(s.wire, KEY).replace("\nold\n", "\nOLD\n");
-        s.wire = Crypto.encrypt(plain, KEY);
+        s.wire = Crypto.encryptV1(plain, KEY);
         a.text = "old\nmemo\nnew\nnewer"; a.sync();
         assertEquals("OLD\nmemo\nnew\nnewer", serverText(s));
     }
@@ -241,13 +241,114 @@ public class SyncEngineTest {
         a.text = "x\ny"; a.sync(); a.text = "x\ny\nz"; a.sync();
         ls.saveState(a.eng.state);
         ls.saveDraft(a.baseWire, "draft text");
-        SyncEngine.State st = ls.loadState();
+        SyncEngine.State st = ls.open().state;
         assertEquals(a.eng.state.base.wire, st.base.wire);
         assertEquals("x\ny\nz", st.base.text);
         assertEquals(a.eng.state.snaps.size(), st.snaps.size());
         assertEquals(a.eng.state.base.hist, st.base.hist);
         assertEquals("draft text", ls.loadDraft().text);
-        assertNull(new LocalStore(dir, "pmtestid", "other-key").loadState()); // wrong key → ignored
+        LocalStore.Opened other = new LocalStore(dir, "pmtestid", "other-key").open();
+        assertNull(other.state);                 // wrong key → separate files, nothing read
+        assertNull(other.draft);
+        assertFalse(other.otherKeyData);
+        assertEquals("draft text", ls.loadDraft().text); // and nothing overwritten
+    }
+
+    /** 0.3.x files (named by ID only) are migrated with the right key, kept with a wrong one. */
+    @Test public void localStoreLegacyFiles() throws Exception {
+        java.io.File dir = java.nio.file.Files.createTempDirectory("pm").toFile();
+        String id = "pmlegacyid";
+        String legacyName = "draft-" + LocalStore.hash(id) + ".dat";
+        String draft = LocalStore.pack(java.util.Arrays.asList("D1", id, "", "unsent text"));
+        java.nio.file.Files.write(new java.io.File(dir, legacyName).toPath(),
+                Crypto.encryptV1(draft, KEY).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        LocalStore.Opened wrong = new LocalStore(dir, id, "mistyped-key").open();
+        assertTrue(wrong.otherKeyData);
+        assertNull(wrong.draft);
+        new LocalStore(dir, id, "mistyped-key").saveDraft(null, ""); // editor saves its (empty) text
+        assertTrue(new java.io.File(dir, legacyName).exists());      // legacy draft untouched
+
+        LocalStore.Opened right = new LocalStore(dir, id, KEY).open();
+        assertFalse(right.otherKeyData);
+        assertEquals("unsent text", right.draft.text);
+        assertFalse(new java.io.File(dir, legacyName).exists());     // migrated
+        assertEquals("unsent text", new LocalStore(dir, id, KEY).loadDraft().text);
+    }
+
+    @Test public void localStoreCorruptFileMovedAside() throws Exception {
+        java.io.File dir = java.nio.file.Files.createTempDirectory("pm").toFile();
+        LocalStore ls = new LocalStore(dir, "pmtestid", KEY);
+        ls.saveDraft(null, "x");
+        java.io.File[] fs = dir.listFiles();
+        assertEquals(1, fs.length);
+        java.nio.file.Files.write(fs[0].toPath(), "PM2.garbage".getBytes());
+        LocalStore.Opened o = new LocalStore(dir, "pmtestid", KEY).open();
+        assertNull(o.draft);
+        assertEquals(1, o.movedAside.size());
+        assertTrue(new java.io.File(dir, o.movedAside.get(0)).exists());
+    }
+
+    @Test public void tooLargeIsNotSent() throws Exception {
+        Server s = new Server();
+        Device a = new Device(s);
+        a.text = "small"; a.sync();
+        int saves = s.saves.get();
+        StringBuilder big = new StringBuilder();
+        java.util.Random r = new java.util.Random(3);
+        while (big.length() < 80_000) big.append(Long.toHexString(r.nextLong())).append('\n');
+        a.text = big.toString();
+        try { a.sync(); fail(); } catch (SyncEngine.TooLargeException expected) { }
+        assertEquals(saves, s.saves.get());
+        assertEquals("small", serverText(s));
+    }
+
+    /** The site keeps something we cannot decrypt after our save: "not saved", not "wrong key". */
+    @Test public void saveRejectedKeepsUnsent() throws Exception {
+        Server s = new Server();
+        Device a = new Device(s);
+        a.text = "v1"; a.sync();
+        String goodBase = a.baseWire;
+        s.afterSave = () -> s.wire = s.wire.substring(0, s.wire.length() / 2); // truncated by site
+        a.text = "v1\nv2";
+        try { a.sync(); fail(); } catch (SyncEngine.SaveRejectedException expected) { }
+        assertEquals(goodBase, a.eng.state.base.wire);       // not marked as sent
+        // Retry in the same session: the mangled copy is ours → re-uploaded (nothing else lost).
+        a.sync();
+        assertEquals("v1\nv2", serverText(s));
+        // A fresh engine (restart) does not know it was ours → never overwritten.
+        s.wire = "PM2.mangled";
+        Device c = new Device(s);
+        c.text = "other";
+        try { c.sync(); fail(); } catch (SyncEngine.KeyMismatchException expected) { }
+        assertEquals("PM2.mangled", s.wire);
+    }
+
+    /** A non-merging writer overwrites after every one of our saves: result is flagged unverified. */
+    @Test public void endlessInterferenceIsUnverified() throws Exception {
+        Server s = new Server();
+        Device a = new Device(s);
+        a.text = "a"; a.sync();
+        final String baseRev = a.eng.state.base.rev;
+        final int[] n = {0};
+        Runnable[] hook = new Runnable[1];
+        hook[0] = () -> {
+            try {
+                String rev = String.format("%012x", 0xabc000 + n[0]);
+                s.wire = Crypto.encrypt(SyncEngine.format(rev, java.util.Collections.singletonList(baseRev),
+                        "a\nb" + (n[0]++)), KEY);
+            } catch (Exception e) { throw new RuntimeException(e); }
+            s.afterSave = hook[0];
+        };
+        a.text = "a\nmine";
+        s.afterSave = hook[0];
+        SyncEngine.Result r = a.eng.sync(a.text, a.baseWire);
+        s.afterSave = null;
+        assertTrue(r.unverified);
+        assertEquals(SyncEngine.MAX_ROUNDS, n[0]);
+        a.text = r.base.text; a.baseWire = r.base.wire;
+        a.sync();
+        assertTrue(serverText(s).contains("mine"));
     }
 
     private void stress(int rounds, int delay, int edits) throws Exception {

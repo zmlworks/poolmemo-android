@@ -152,7 +152,12 @@ public class MainActivity extends Activity {
     private void copyKey() {
         String k = keyBox.getText().toString();
         ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        cm.setPrimaryClip(ClipData.newPlainText("key", k));
+        ClipData clip = ClipData.newPlainText("key", k);
+        // Hide the key from the clipboard preview / keyboard suggestions (Android 13+).
+        android.os.PersistableBundle extras = new android.os.PersistableBundle();
+        extras.putBoolean("android.content.extra.IS_SENSITIVE", true); // ClipDescription.EXTRA_IS_SENSITIVE
+        clip.getDescription().setExtras(extras);
+        cm.setPrimaryClip(clip);
         Toast.makeText(this, R.string.copied, Toast.LENGTH_SHORT).show();
     }
 

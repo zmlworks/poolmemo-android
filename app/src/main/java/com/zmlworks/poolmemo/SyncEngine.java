@@ -26,6 +26,28 @@ final class SyncEngine {
     static final int MAX_HIST = 32;
     static final int MAX_SNAPS = 8;
     static final int MAX_ROUNDS = 4;
+    /** PoolSketch pages are limited in size; bigger wires get cut and become undecryptable. */
+    static final int MAX_WIRE = 100_000;
+
+    /** Server content cannot be decrypted with our key (other key / not ours): never overwritten. */
+    static final class KeyMismatchException extends Exception {
+        KeyMismatchException(Throwable cause) { super("decrypt failed", cause); }
+    }
+
+    /** The encrypted memo would exceed {@link #MAX_WIRE}; nothing was sent. */
+    static final class TooLargeException extends Exception {
+        final int length;
+        TooLargeException(int length) { super("too large: " + length); this.length = length; }
+    }
+
+    /**
+     * Our write was accepted by the site but reading it back gives something we cannot
+     * decrypt (e.g. truncated / rejected by the site). The text stays unsent; the next
+     * sync in this session may overwrite exactly that mangled copy (it was ours).
+     */
+    static final class SaveRejectedException extends Exception {
+        SaveRejectedException() { super("save not stored correctly"); }
+    }
 
     interface Remote {
         String fetch() throws Exception;
@@ -63,6 +85,12 @@ final class SyncEngine {
         String synced;      // the local text that was passed in (UI rebases edits made since)
         boolean wrote;
         boolean conflict;   // a conflict marker was added
+        /**
+         * Other devices kept writing during all rounds: the last write could not be
+         * confirmed. base is the last server version merged; the caller should keep the
+         * text marked unsent and retry later.
+         */
+        boolean unverified;
     }
 
     private final Remote remote;
@@ -70,6 +98,8 @@ final class SyncEngine {
     private final Persist persist;
     final State state;
     private final SecureRandom rnd = new SecureRandom();
+    /** Undecryptable wire read back right after our own save (see SaveRejectedException). */
+    private String rejectedWire;
 
     SyncEngine(Remote remote, Codec codec, Persist persist, State state) {
         this.remote = remote; this.codec = codec; this.persist = persist;
@@ -134,7 +164,12 @@ final class SyncEngine {
 
     // ---------- state helpers ----------
 
-    Snap findByWire(String wire) {
+    /** Current base (thread-safe snapshot). */
+    synchronized Snap base() {
+        return state.base;
+    }
+
+    synchronized Snap findByWire(String wire) {
         if (wire == null) return null;
         for (Snap s : state.snaps) if (wire.equals(s.wire)) return s;
         return null;
@@ -171,7 +206,7 @@ final class SyncEngine {
     }
 
     /** Local text as rebased onto the current state.base (for a UI that lags behind). */
-    String rebase(String local, String localBaseWire) {
+    synchronized String rebase(String local, String localBaseWire) {
         Snap base = state.base;
         if (base == null) return local;
         if (localBaseWire != null && localBaseWire.equals(base.wire)) return local;
@@ -186,22 +221,50 @@ final class SyncEngine {
         res.synced = local;
         String L = rebase(local, localBaseWire);
         String prefetched = null;
+        boolean verifying = false;
+        Snap mine = null, before = null; // our last write and the version it replaced
         for (int round = 0; round < MAX_ROUNDS; round++) {
             String xw = prefetched != null ? prefetched : norm(remote.fetch());
             prefetched = null;
             Snap base = state.base;
             Snap x;
             String ancestor;
+            boolean ownGarbage = false;
             if (base != null && xw.equals(base.wire)) {
                 if (L.equals(base.text)) { res.base = base; return res; }
                 x = base;
                 ancestor = base.text;
             } else {
-                x = parse(xw, codec.decrypt(xw)); // throws on foreign/wrong-key content: never overwrite
-                ancestor = ancestorFor(x);
+                Snap px = null;
+                try {
+                    px = parse(xw, codec.decrypt(xw)); // foreign/wrong-key content: never overwrite
+                } catch (Exception e) {
+                    if (verifying) {
+                        // Read-back of our own write is undecryptable: the site did not store it.
+                        rejectedWire = xw;
+                        if (mine != null) {
+                            state.snaps.remove(mine); // not sent: base = what it replaced
+                            state.base = before;
+                            persist.save(state);
+                        }
+                        throw new SaveRejectedException();
+                    }
+                    if (!xw.equals(rejectedWire)) throw new KeyMismatchException(e);
+                    // Still the mangled copy of our own earlier write (seen this session):
+                    // its content is already merged in L, so re-upload like a wiped page.
+                    ownGarbage = true;
+                }
+                if (ownGarbage) {
+                    x = base != null ? base : parse("", "");
+                    ancestor = x.text;
+                } else {
+                    x = px;
+                    ancestor = ancestorFor(x);
+                }
             }
+            verifying = false;
             // Server copy vanished (expired / wiped) while we know content: re-upload ours.
-            boolean lost = xw.isEmpty() && base != null && !base.text.isEmpty();
+            boolean lost = ownGarbage || (xw.isEmpty() && base != null && !base.text.isEmpty());
             String r = lost ? L : Merge3.merge(ancestor, L, x.text);
             if (count(r, Merge3.MARKER) > Math.max(count(L, Merge3.MARKER), count(x.text, Merge3.MARKER)))
                 res.conflict = true;
@@ -220,6 +283,7 @@ final class SyncEngine {
             while (hist.size() > MAX_HIST) hist.remove(hist.size() - 1);
             String rev = newRev();
             String wire = codec.encrypt(format(rev, hist, r));
+            if (wire.length() > MAX_WIRE) throw new TooLargeException(wire.length());
             Snap m = new Snap(wire, rev, hist, r, false);
             remember(x);
             remote.save(wire);
@@ -234,11 +298,17 @@ final class SyncEngine {
             } catch (Exception e) {
                 return res; // written; the delayed re-check will verify later
             }
-            if (vw.equals(wire)) return res;
-            // Another device wrote around the same time: merge again on top of it.
+            if (vw.equals(wire)) { rejectedWire = null; return res; }
+            // Another device wrote around the same time (or the site mangled ours):
+            // merge again on top of it.
             L = r;
             prefetched = vw;
+            verifying = true;
+            mine = m;
+            before = x;
         }
+        // Rounds exhausted: the server still differs from what we wrote.
+        res.unverified = true;
         return res;
     }
 

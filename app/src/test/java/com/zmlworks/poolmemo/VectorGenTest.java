@@ -9,8 +9,44 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 
-/** Writes merge/header vectors for the Windows C port (PM_VEC_OUT=path). */
+/**
+ * Writes vectors for the Windows C port:
+ *  PM_VEC_OUT=path        merge/header vectors (windows/test/vectors.bin)
+ *  PM_CRYPTO_VEC_OUT=path PM2/PM1 wires the C side must decrypt ("C") or reject ("X")
+ *                         (windows/test/crypto_vectors.bin)
+ */
 public class VectorGenTest {
+    @Test public void genCrypto() throws Exception {
+        String out = System.getenv("PM_CRYPTO_VEC_OUT");
+        Assume.assumeTrue(out != null);
+        String raw = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
+        String pass = "合言葉 passphrase";
+        java.security.SecureRandom r = new java.security.SecureRandom();
+        byte[] salt = new byte[16];
+        List<String> f = new ArrayList<>();
+        String[][] cases = {
+                {raw, "raw key from Java\n2行目"},
+                {raw, ""},
+                {pass, "PBKDF2 600k from Java — プールメモ"},
+                {" " + pass + "\t", "trimmed passphrase from Java"},
+                {"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "unpadded raw key"},
+        };
+        for (String[] c : cases) {
+            f.add("C"); f.add(c[0]); f.add(Crypto.encrypt(c[1], c[0])); f.add(c[1]);
+        }
+        r.nextBytes(salt);
+        f.add("C"); f.add("short"); f.add(Crypto.encryptWith("min iterations", "short", salt, Crypto.MIN_ITER)); f.add("min iterations");
+        r.nextBytes(salt);
+        f.add("C"); f.add(pass); f.add(Crypto.encryptWith(new String(new char[20000]).replace("\0", "x"), pass, salt, 20000)); f.add(new String(new char[20000]).replace("\0", "x"));
+        f.add("C"); f.add(pass); f.add(Crypto.encryptV1("legacy PM1 passphrase", pass)); f.add("legacy PM1 passphrase");
+        f.add("C"); f.add(raw); f.add(Crypto.encryptV1("legacy PM1 raw", raw)); f.add("legacy PM1 raw");
+        f.add("X"); f.add("wrong passphrase"); f.add(Crypto.encrypt("nope", pass));
+        f.add("X"); f.add(pass); f.add(Crypto.encrypt("raw-key memo", raw));
+        try (FileOutputStream os = new FileOutputStream(out)) {
+            os.write(LocalStoreBytes.pack(f));
+        }
+    }
+
     @Test public void gen() throws Exception {
         String out = System.getenv("PM_VEC_OUT");
         Assume.assumeTrue(out != null);

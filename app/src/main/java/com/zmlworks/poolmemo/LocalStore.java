@@ -5,33 +5,101 @@ import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * App-private, encrypted (memo key, PM1 format) local copies:
+ * App-private, encrypted (memo key, {@link Crypto} format) local copies:
  *  sync-&lt;h&gt;.dat  — last known server base + recent versions (for 3-way merge)
  *  draft-&lt;h&gt;.dat — the editor text not yet confirmed on the server, plus its base wire
+ * <p>
+ * h = hash(id + key) since 0.4.0, so opening a memo with a different (e.g. mistyped) key
+ * uses different files and can never overwrite unsent text saved under the right key.
+ * Files of 0.3.x (h = hash(id)) are migrated when they decrypt with the current key and
+ * left untouched otherwise (they come back once the right key is entered). A current-name
+ * file that cannot be read is moved aside to "*.bad-&lt;time&gt;" instead of being overwritten.
+ * <p>
+ * All file access goes through one process-wide lock, so several instances (activity
+ * re-creation, background job) never interleave.
  */
 final class LocalStore {
+    private static final Object LOCK = new Object();
+
     private final File dir;
-    private final String id, key, tag;
+    private final String id, key, tag, legacyTag;
 
     LocalStore(File dir, String id, String key) {
         this.dir = dir; this.id = id; this.key = key;
-        this.tag = hash(id);
+        this.tag = hash(id + "\n" + key.trim());
+        this.legacyTag = hash(id);
     }
 
     static final class Draft {
         final String baseWire, text;
         Draft(String baseWire, String text) { this.baseWire = baseWire; this.text = text; }
+        boolean same(Draft o) {
+            return o != null && text.equals(o.text)
+                    && (baseWire == null ? o.baseWire == null : baseWire.equals(o.baseWire));
+        }
+    }
+
+    /** What {@link #open()} found. */
+    static final class Opened {
+        SyncEngine.State state;
+        Draft draft;
+        /** A 0.3.x file of this ID exists that the current key cannot decrypt (other key). */
+        boolean otherKeyData;
+        /** Unreadable files that were moved aside (names). */
+        final List<String> movedAside = new ArrayList<>();
+    }
+
+    /** Loads state + draft, migrating / quarantining files as described above. Slow (crypto). */
+    Opened open() {
+        synchronized (LOCK) {
+            Opened o = new Opened();
+            List<String> s = load("sync", o), d = load("draft", o);
+            o.state = parseState(s);
+            o.draft = parseDraft(d);
+            return o;
+        }
+    }
+
+    private List<String> load(String kind, Opened o) {
+        File cur = new File(dir, kind + "-" + tag + ".dat");
+        if (cur.exists()) {
+            try {
+                return read(cur);
+            } catch (Exception e) {
+                File bad = new File(dir, cur.getName() + ".bad-"
+                        + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date()));
+                if (cur.renameTo(bad)) o.movedAside.add(bad.getName());
+                else o.movedAside.add(cur.getName());
+                return null;
+            }
+        }
+        File old = new File(dir, kind + "-" + legacyTag + ".dat");
+        if (!old.exists()) return null;
+        List<String> f;
+        try {
+            f = read(old);
+        } catch (Exception e) {
+            o.otherKeyData = true; // keep it: it is readable with the key it was written with
+            return null;
+        }
+        if (write(cur, f)) {
+            //noinspection ResultOfMethodCallIgnored
+            old.delete();
+        }
+        return f;
     }
 
     // ----- state -----
 
-    SyncEngine.State loadState() {
+    private SyncEngine.State parseState(List<String> f) {
         try {
-            List<String> f = read("sync-" + tag + ".dat");
             if (f == null || f.size() < 2 || !"S2".equals(f.get(0)) || !id.equals(f.get(1))) return null;
             SyncEngine.State st = new SyncEngine.State();
             int i = 2;
@@ -50,7 +118,8 @@ final class LocalStore {
         }
     }
 
-    void saveState(SyncEngine.State st) {
+    /** @return false if the file could not be written. */
+    boolean saveState(SyncEngine.State st) {
         List<String> f = new ArrayList<>();
         f.add("S2"); f.add(id);
         List<SyncEngine.Snap> snaps = new ArrayList<>(st.snaps);
@@ -62,54 +131,74 @@ final class LocalStore {
             f.add(s.wire); f.add(s.rev); f.add(s.legacy ? "1" : "0");
             f.add(String.join(",", s.hist)); f.add(s.text);
         }
-        write("sync-" + tag + ".dat", f);
+        synchronized (LOCK) {
+            return write(new File(dir, "sync-" + tag + ".dat"), f);
+        }
     }
 
     // ----- draft -----
 
+    private Draft parseDraft(List<String> f) {
+        if (f == null || f.size() != 4 || !"D1".equals(f.get(0)) || !id.equals(f.get(1))) return null;
+        return new Draft(f.get(2).isEmpty() ? null : f.get(2), f.get(3));
+    }
+
     Draft loadDraft() {
-        try {
-            List<String> f = read("draft-" + tag + ".dat");
-            if (f == null || f.size() != 4 || !"D1".equals(f.get(0)) || !id.equals(f.get(1))) return null;
-            return new Draft(f.get(2).isEmpty() ? null : f.get(2), f.get(3));
-        } catch (Exception e) {
-            return null;
+        synchronized (LOCK) {
+            File cur = new File(dir, "draft-" + tag + ".dat");
+            try {
+                return cur.exists() ? parseDraft(read(cur)) : null;
+            } catch (Exception e) {
+                return null;
+            }
         }
     }
 
-    void saveDraft(String baseWire, String text) {
+    /** @return false if the file could not be written. */
+    boolean saveDraft(String baseWire, String text) {
+        synchronized (LOCK) {
+            return write(new File(dir, "draft-" + tag + ".dat"), draftFields(baseWire, text));
+        }
+    }
+
+    /** Replaces the draft only if it is still {@code expected} (used by the background job). */
+    boolean replaceDraftIf(Draft expected, String baseWire, String text) {
+        synchronized (LOCK) {
+            Draft now = loadDraft();
+            if (expected == null ? now != null : !expected.same(now)) return false;
+            return write(new File(dir, "draft-" + tag + ".dat"), draftFields(baseWire, text));
+        }
+    }
+
+    private List<String> draftFields(String baseWire, String text) {
         List<String> f = new ArrayList<>();
         f.add("D1"); f.add(id); f.add(baseWire == null ? "" : baseWire); f.add(text);
-        write("draft-" + tag + ".dat", f);
+        return f;
     }
 
     // ----- io -----
 
-    private List<String> read(String name) throws Exception {
-        File file = new File(dir, name);
-        if (!file.exists()) return null;
+    private List<String> read(File file) throws Exception {
         String wire = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
         return unpack(Crypto.decrypt(wire, key));
     }
 
-    private synchronized void write(String name, List<String> fields) {
+    private boolean write(File dst, List<String> fields) {
+        File tmp = new File(dir, dst.getName() + ".tmp");
         try {
             String wire = Crypto.encrypt(pack(fields), key);
-            File tmp = new File(dir, name + ".tmp");
             try (FileOutputStream os = new FileOutputStream(tmp)) {
                 os.write(wire.getBytes(StandardCharsets.UTF_8));
                 os.getFD().sync();
             }
-            File dst = new File(dir, name);
-            if (!tmp.renameTo(dst)) {
-                //noinspection ResultOfMethodCallIgnored
-                dst.delete();
-                //noinspection ResultOfMethodCallIgnored
-                tmp.renameTo(dst);
-            }
+            // File.renameTo replaces atomically on Android (rename(2)).
+            if (tmp.renameTo(dst)) return true;
         } catch (Exception ignored) {
-            // best effort; the editor still holds the text
+            // reported to the caller
         }
+        //noinspection ResultOfMethodCallIgnored
+        tmp.delete();
+        return false;
     }
 
     static String pack(List<String> fields) {
@@ -130,7 +219,7 @@ final class LocalStore {
         return out;
     }
 
-    private static String hash(String s) {
+    static String hash(String s) {
         try {
             byte[] d = MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8));
             StringBuilder sb = new StringBuilder();

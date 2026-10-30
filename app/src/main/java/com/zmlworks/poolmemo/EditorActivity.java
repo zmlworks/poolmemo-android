@@ -14,9 +14,6 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.Toast;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
 /**
  * Full-window dark editor: settings only. Sync (merge-safe, see {@link SyncEngine}) on
  * 15 s idle, pause/stop and resume. Unsent text is kept in an encrypted local draft.
@@ -29,14 +26,16 @@ public class EditorActivity extends Activity {
     private BulletEditText editor;
     private String id, key;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ExecutorService io = Executors.newSingleThreadExecutor();
     private static final long DRAFT_MS = 1_000L;
     private static final long VERIFY_MS = 8_000L;
     private static final long RETRY_MS = 30_000L;
     private static final long TOAST_GAP_MS = 5 * 60_000L;
 
-    private LocalStore store;
+    private MemoSession session;
+    /** Set once the local copy is shown (loading decrypts off the UI thread). */
     private SyncEngine engine;
+    /** Last sync failed / was not confirmed: text may not be on the server yet. */
+    private boolean pending;
     /** Wire of the server version the editor text is based on (null = none yet). */
     private String editorBaseWire;
     private String editorBaseText = "";
@@ -78,7 +77,8 @@ public class EditorActivity extends Activity {
         editor.setBackgroundColor(Ui.EDIT_BG);
         editor.setTextColor(Ui.TEXT);
         editor.setHintTextColor(Ui.DIM);
-        editor.setHint("メモを入力…");
+        editor.setHint(R.string.loading);
+        editor.setEnabled(false);
         editor.setGravity(Gravity.TOP | Gravity.START);
         editor.setPadding(0, p, p, p);
         editor.setTextSize(EDITOR_SP);
@@ -98,8 +98,8 @@ public class EditorActivity extends Activity {
 
         setContentView(root);
         Ui.edgeToEdge(this, root);
+        session = MemoSession.get(this, id, key);
         openLocal();
-        requestSync();
     }
 
     private void goSetup(boolean force) {
@@ -109,40 +109,66 @@ public class EditorActivity extends Activity {
         finish();
     }
 
-    /** Show the local copy (unsent draft or last synced text) immediately. */
+    /** Show the local copy (unsent draft or last synced text) as soon as it is decrypted. */
     private void openLocal() {
-        final String fid = id, fkey = key;
-        store = new LocalStore(getFilesDir(), fid, fkey);
-        SyncEngine.State st = store.loadState();
-        engine = new SyncEngine(new SyncEngine.Remote() {
-            @Override public String fetch() throws Exception { return PoolSketch.fetch(fid); }
-            @Override public void save(String wire) throws Exception { PoolSketch.save(fid, wire); }
-        }, new SyncEngine.Codec() {
-            @Override public String encrypt(String plain) throws Exception { return Crypto.encrypt(plain, fkey); }
-            @Override public String decrypt(String wire) throws Exception { return Crypto.decrypt(wire, fkey); }
-        }, store::saveState, st);
-        String text = "";
-        editorBaseWire = null;
-        editorBaseText = "";
-        if (st != null && st.base != null) {
-            editorBaseWire = st.base.wire;
-            editorBaseText = st.base.text;
-            text = st.base.text;
-        }
-        LocalStore.Draft d = store.loadDraft();
-        if (d != null) {
-            if (d.baseWire != null && d.baseWire.equals(editorBaseWire)) {
-                text = d.text;
-            } else {
-                // Draft was based on an older/unknown server version: merge, never drop.
-                SyncEngine.Snap db = engine.findByWire(d.baseWire);
-                text = Merge3.merge(db != null ? db.text : "", d.text, text);
+        final MemoSession ses = session;
+        MemoSession.NET.execute(() -> {
+            String text;
+            String baseWire = null, baseText = "";
+            LocalStore.Opened report;
+            try {
+                SyncEngine eng = ses.engine();
+                report = ses.takeOpenReport();
+                SyncEngine.Snap base = eng.base();
+                text = "";
+                if (base != null) { baseWire = base.wire; baseText = base.text; text = base.text; }
+                LocalStore.Draft d = ses.store.loadDraft();
+                if (d != null) {
+                    if (d.baseWire != null && d.baseWire.equals(baseWire)) {
+                        text = d.text;
+                    } else {
+                        // Draft was based on an older/unknown server version: merge, never drop.
+                        SyncEngine.Snap db = eng.findByWire(d.baseWire);
+                        text = Merge3.merge(db != null ? db.text : "", d.text, text);
+                    }
+                }
+            } catch (RuntimeException e) {
+                handler.post(() -> {
+                    if (!isDestroyed()) toast(getString(R.string.load_failed) + ": " + e.getMessage(), true);
+                });
+                return;
             }
-        }
+            final String ft = text, fbw = baseWire, fbt = baseText;
+            final LocalStore.Opened fr = report;
+            handler.post(() -> onLocalLoaded(ses, ft, fbw, fbt, fr));
+        });
+    }
+
+    private void onLocalLoaded(MemoSession ses, String text, String baseWire, String baseText,
+                               LocalStore.Opened report) {
+        if (isDestroyed() || ses != session) return;
+        engine = ses.engine(); // already created: returns immediately
+        editorBaseWire = baseWire;
+        editorBaseText = baseText;
         applying = true;
         editor.setText(text);
         editor.setSelection(0);
         applying = false;
+        editor.setHint("メモを入力…");
+        editor.setEnabled(true);
+        if (report != null) {
+            if (report.otherKeyData) {
+                new android.app.AlertDialog.Builder(this)
+                        .setTitle(R.string.other_key_title)
+                        .setMessage(R.string.other_key_msg)
+                        .setPositiveButton(android.R.string.ok, null)
+                        .show();
+            }
+            if (!report.movedAside.isEmpty()) {
+                toast(getString(R.string.moved_aside, String.join(", ", report.movedAside)), true);
+            }
+        }
+        requestSync();
     }
 
     private boolean dirty() {
@@ -151,8 +177,17 @@ public class EditorActivity extends Activity {
 
     private void persistDraft() {
         handler.removeCallbacks(draftSave);
-        if (store == null || editor == null) return;
-        store.saveDraft(editorBaseWire, editor.getText().toString());
+        if (engine == null || editor == null) return;
+        final LocalStore st = session.store;
+        final String bw = editorBaseWire, text = editor.getText().toString();
+        MemoSession.DISK.execute(() -> {
+            if (!st.saveDraft(bw, text)) {
+                handler.post(() -> {
+                    if (!isDestroyed()) toast(getString(R.string.local_save_failed), false);
+                    else Toast.makeText(getApplicationContext(), R.string.local_save_failed, Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     /** Fetch, merge, write if needed, verify. Coalesces concurrent requests. */
@@ -165,7 +200,7 @@ public class EditorActivity extends Activity {
         final String local = editor.getText().toString();
         final String baseWire = editorBaseWire;
         final SyncEngine eng = engine;
-        io.execute(() -> {
+        MemoSession.NET.execute(() -> {
             SyncEngine.Result r = null;
             Exception err = null;
             try {
@@ -192,17 +227,34 @@ public class EditorActivity extends Activity {
             replaceKeepingCursor(next);
             persistDraft();
             if (r.conflict) toast(getString(R.string.merged_conflict), true);
-            if (r.wrote) {
-                handler.removeCallbacks(verify);
-                handler.postDelayed(verify, VERIFY_MS);
+            if (r.unverified) {
+                // Other devices kept writing: our text is not confirmed on the server yet.
+                pending = true;
+                handler.removeCallbacks(idleSave);
+                handler.postDelayed(idleSave, RETRY_MS);
+            } else {
+                pending = false;
+                if (r.wrote) {
+                    handler.removeCallbacks(verify);
+                    handler.postDelayed(verify, VERIFY_MS);
+                }
             }
         } else if (e != null) {
+            pending = true;
             persistDraft();
-            if (e instanceof IllegalArgumentException || e instanceof javax.crypto.AEADBadTagException) {
+            if (e instanceof SyncEngine.KeyMismatchException) {
                 toast(getString(R.string.decrypt_failed), true);
+            } else if (e instanceof SyncEngine.SaveRejectedException) {
+                toast(getString(R.string.save_rejected), true);
+                handler.removeCallbacks(idleSave);
+                handler.postDelayed(idleSave, RETRY_MS);
+            } else if (e instanceof SyncEngine.TooLargeException) {
+                toast(getString(R.string.too_large, ((SyncEngine.TooLargeException) e).length,
+                        SyncEngine.MAX_WIRE), true);
             } else {
                 toast(getString(R.string.save_failed) + ": " + e.getMessage(), false);
-                if (dirty()) handler.postDelayed(idleSave, RETRY_MS);
+                handler.removeCallbacks(idleSave);
+                handler.postDelayed(idleSave, RETRY_MS);
             }
         }
         if (syncAgain) requestSync(); // a trigger arrived while syncing (pause, resume, …)
@@ -255,14 +307,17 @@ public class EditorActivity extends Activity {
         super.onStop();
         if (engine == null) return;
         persistDraft();
-        if (dirty()) requestSync();
+        if (dirty() || pending) {
+            requestSync();
+            // Safety net if the process goes away before that sync finishes / succeeds.
+            SyncJobService.schedule(getApplicationContext());
+        }
     }
 
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
-        if (engine != null) persistDraft();
-        io.shutdown(); // let a running save finish
+        if (engine != null) persistDraft(); // queued on the shared executor; outlives us
         super.onDestroy();
     }
 }

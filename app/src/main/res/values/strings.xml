@@ -19,7 +19,13 @@
     <string name="loaded">読込みました</string>
     <string name="save_failed">保存に失敗しました</string>
     <string name="load_failed">読込みに失敗しました</string>
-    <string name="decrypt_failed">復号できません（キーが違うか平文です）</string>
+    <string name="decrypt_failed">クラウドの内容を復号できません（キーが違うか、別のアプリの内容です）。クラウド側は上書きしていません。この端末の内容は端末内に保存済みです。</string>
+    <string name="save_rejected">サイトに保存できなかったようです（保存後に読み返した内容が壊れていました）。この端末の内容は未送信のまま端末内に残し、しばらくして再送します。</string>
+    <string name="too_large">メモが大きすぎるため送信しませんでした（暗号文 %1$d 文字／上限 %2$d 文字）。内容を減らしてください。端末内には保存済みです。</string>
+    <string name="local_save_failed">端末内への保存に失敗しました（空き容量を確認してください）</string>
+    <string name="other_key_title">別のキーで保存された未送信データがあります</string>
+    <string name="other_key_msg">この ID には、今のキーでは読めない端末内データ（前のバージョンで別のキーで保存した未送信の下書きなど）が残っています。キーの入力ミスなら、設定で正しいキーを入れ直すと戻ります。このデータは消さずに残してあります。</string>
+    <string name="moved_aside">読めない端末内データを上書きせず退避しました: %1$s</string>
     <string name="empty_remote">クラウドは空です（新規メモ）</string>
     <string name="need_id_key">ID とキーを入力してください</string>
     <string name="invalid_id">ID が不正です（6〜200・英数-_）</string>

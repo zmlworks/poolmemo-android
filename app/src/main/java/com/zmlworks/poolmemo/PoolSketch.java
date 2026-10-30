@@ -24,7 +24,7 @@ final class PoolSketch {
         HttpURLConnection c = (HttpURLConnection) new URL(base + "/" + id).openConnection();
         c.setConnectTimeout(20000);
         c.setReadTimeout(30000);
-        c.setRequestProperty("User-Agent", "PoolMemo/0.3 (Android)");
+        c.setRequestProperty("User-Agent", "PoolMemo/0.4 (Android)");
         c.setInstanceFollowRedirects(true);
         c.setUseCaches(false);
         c.setRequestProperty("Cache-Control", "no-cache");
@@ -53,7 +53,7 @@ final class PoolSketch {
         c.setReadTimeout(30000);
         c.setDoOutput(true);
         c.setRequestMethod("POST");
-        c.setRequestProperty("User-Agent", "PoolMemo/0.3 (Android)");
+        c.setRequestProperty("User-Agent", "PoolMemo/0.4 (Android)");
         c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
         c.setFixedLengthStreamingMode(bytes.length);
         try (OutputStream os = c.getOutputStream()) {
